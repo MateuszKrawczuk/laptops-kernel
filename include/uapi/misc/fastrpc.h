@@ -166,4 +166,22 @@ struct fastrpc_ioctl_capability {
 	__u32 reserved[4];
 };
 
+enum fastrpc_dspsignal_type {
+	FASTRPC_DSPSIGNAL_SIGNAL = 1,
+	FASTRPC_DSPSIGNAL_WAIT = 2,
+	FASTRPC_DSPSIGNAL_CREATE = 3,
+	FASTRPC_DSPSIGNAL_DESTROY = 4,
+	FASTRPC_DSPSIGNAL_CANCEL_WAIT = 5,
+};
+
+struct fastrpc_internal_dspsignal {
+	__u32 req;
+	__u32 signal_id;
+	union {
+		__u32 flags;
+		__u32 timeout_usec;
+	};
+};
+
 #endif /* __QCOM_FASTRPC_H__ */
+

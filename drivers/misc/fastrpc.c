@@ -3131,12 +3131,12 @@ static int fastrpc_rpmsg_callback(struct rpmsg_device *rpdev, void *data,
 	u32 rsp_flags = 0;
 	u32 early_wake_time = 0;
 
-	if (len < sizeof(*rsp))
 	if (len == sizeof(uint64_t)) {
 		fastrpc_handle_signal_rpmsg(*((uint64_t *)data), cctx);
 		return 0;
 	}
 
+	if (len < sizeof(*rsp))
 		return -EINVAL;
 
 	if (len >= sizeof(*rspv2)) {

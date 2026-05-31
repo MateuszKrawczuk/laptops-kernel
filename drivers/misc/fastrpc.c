@@ -1414,6 +1414,19 @@ static int fastrpc_internal_invoke(struct fastrpc_user *fl,  u32 kernel,
 	if (err)
 		goto bail;
 
+	/* FRPC-DIAG: characterize each invoke we send */
+	{
+		static int diag_s;
+
+		if (diag_s < 80) {
+			diag_s++;
+			dev_info(fl->sctx->dev,
+				 "FRPC-DIAG tx#%d ctxid=0x%llx handle=0x%x sc=0x%x pd=%d kernel=%d\n",
+				 diag_s, (unsigned long long)ctx->ctxid, handle, sc,
+				 fl->pd, kernel);
+		}
+	}
+
 	fastrpc_wait_for_completion(ctx, &interrupted, kernel);
 	if (interrupted != 0) {
 		err = interrupted;
@@ -3065,6 +3078,10 @@ static void fastrpc_handle_signal_rpmsg(uint64_t msg, struct fastrpc_channel_ctx
 	struct fastrpc_user *fl;
 	unsigned long irq_flags = 0;
 
+	dev_info(&cctx->rpdev->dev,
+		 "FRPC-DIAG sig-rx: pid=%u signal_id=%u msg=0x%llx\n",
+		 pid, signal_id, (unsigned long long)msg);
+
 	if (signal_id >= FASTRPC_DSPSIGNAL_NUM_SIGNALS)
 		return;
 
@@ -3131,6 +3148,29 @@ static int fastrpc_rpmsg_callback(struct rpmsg_device *rpdev, void *data,
 	u32 rsp_flags = 0;
 	u32 early_wake_time = 0;
 
+	/* FRPC-DIAG: log every incoming rpmsg packet */
+	{
+		static int diag_n;
+		u32 dflags = 0, dewt = 0, dver = 0;
+
+		if (len >= (int)sizeof(struct fastrpc_invoke_rspv2)) {
+			struct fastrpc_invoke_rspv2 *r2 = data;
+
+			dflags = r2->flags;
+			dewt = r2->early_wake_time;
+			dver = r2->version;
+		}
+		if (diag_n < 80) {
+			diag_n++;
+			dev_info(&rpdev->dev,
+				 "FRPC-DIAG rx#%d len=%d ctx=0x%llx retval=%d flags=%u ewt=%u ver=%u\n",
+				 diag_n, len,
+				 len >= (int)sizeof(*rsp) ? (unsigned long long)rsp->ctx : 0,
+				 len >= (int)sizeof(*rsp) ? rsp->retval : 0,
+				 dflags, dewt, dver);
+		}
+	}
+
 	if (len == sizeof(uint64_t)) {
 		fastrpc_handle_signal_rpmsg(*((uint64_t *)data), cctx);
 		return 0;
@@ -3152,7 +3192,9 @@ static int fastrpc_rpmsg_callback(struct rpmsg_device *rpdev, void *data,
 	ctx = idr_find(&cctx->ctx_idr, ctxid);
 
 	if (!ctx) {
-		dev_info(&cctx->rpdev->dev, "Warning: No context ID matches response\n");
+		dev_info(&cctx->rpdev->dev,
+			 "FRPC-DIAG no-ctx drop: len=%d ctx=0x%llx ctxid=0x%lx\n",
+			 len, (unsigned long long)rsp->ctx, ctxid);
 		spin_unlock_irqrestore(&cctx->lock, flags);
 		return 0;
 	}

@@ -2355,6 +2355,19 @@ static int fastrpc_get_dsp_info(struct fastrpc_user *fl, char __user *argp)
 
 	cap.capability = 0;
 
+	/* Driver-side caps answered without DSP query.
+	 * 259 == DSPSIGNAL_DRIVER_SUPPORT in userspace libcdsprpc. Without
+	 * this we cannot signal to userspace that the kernel implements the
+	 * FASTRPC_IOCTL_DSPSIGNAL_* path; userspace then falls back to
+	 * dspqueue_rpc_wait_signal RPCs which mainline does not route.
+	 */
+	if (cap.attribute_id == 259) {
+		cap.capability = 1;
+		if (copy_to_user(argp, &cap, sizeof(cap)))
+			return -EFAULT;
+		return 0;
+	}
+
 	if (cap.attribute_id >= FASTRPC_MAX_DSP_ATTRIBUTES) {
 		dev_err(&fl->cctx->rpdev->dev, "Error: invalid attribute: %d, err: %d\n",
 			cap.attribute_id, err);

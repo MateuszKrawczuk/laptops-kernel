@@ -2024,7 +2024,7 @@ static int fastrpc_dspsignal_wait(struct fastrpc_user *fl,
 	}
 	spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
 
-	if (timeout != 0xffffffff)
+	if (fsig->timeout_usec != FASTRPC_DSPSIGNAL_TIMEOUT_NONE)
 		ret = wait_for_completion_interruptible_timeout(&s->comp, timeout);
 	else
 		ret = wait_for_completion_interruptible(&s->comp);
@@ -2237,9 +2237,9 @@ static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 		kfree(args);
 		break;
 	case FASTRPC_INVOKE_DSPSIGNAL:
-		if (invoke.size > sizeof(*fsig))
+		if (invoke.size != sizeof(*fsig))
 			return -EINVAL;
-		fsig = kzalloc(invoke.size, GFP_KERNEL);
+		fsig = kzalloc(sizeof(*fsig), GFP_KERNEL);
 		if (!fsig)
 			return -ENOMEM;
 		if (copy_from_user(fsig, (void __user *)(uintptr_t)invoke.invparam,
@@ -3075,7 +3075,7 @@ static void fastrpc_handle_signal_rpmsg(uint64_t msg, struct fastrpc_channel_ctx
 {
 	u32 pid = msg >> 32;
 	u32 signal_id = msg & 0xffffffff;
-	struct fastrpc_user *fl;
+	struct fastrpc_user *fl, *found = NULL;
 	unsigned long irq_flags = 0;
 
 	dev_info(&cctx->rpdev->dev,
@@ -3085,15 +3085,30 @@ static void fastrpc_handle_signal_rpmsg(uint64_t msg, struct fastrpc_channel_ctx
 	if (signal_id >= FASTRPC_DSPSIGNAL_NUM_SIGNALS)
 		return;
 
+	/*
+	 * Hold cctx->lock across the lookup AND the signal completion: it both
+	 * serialises iteration of cctx->users against open/release (which add/
+	 * remove fl under the same lock) and keeps the matched fl alive while we
+	 * touch its dspsignals. Lock order is cctx->lock -> dspsignals_lock;
+	 * nothing takes them in the reverse order.
+	 */
+	spin_lock_irqsave(&cctx->lock, irq_flags);
 	list_for_each_entry(fl, &cctx->users, user) {
-		if (fl->client_id == pid)
+		if (fl->client_id == pid) {
+			found = fl;
 			break;
+		}
+	}
+	if (!found) {
+		spin_unlock_irqrestore(&cctx->lock, irq_flags);
+		pr_err("fastrpc: signal %u for unknown PID %u\n", signal_id, pid);
+		return;
 	}
 
-	spin_lock_irqsave(&fl->dspsignals_lock, irq_flags);
-	if (fl->signal_groups[signal_id / FASTRPC_DSPSIGNAL_GROUP_SIZE]) {
+	spin_lock(&found->dspsignals_lock);
+	if (found->signal_groups[signal_id / FASTRPC_DSPSIGNAL_GROUP_SIZE]) {
 		struct fastrpc_dspsignal *group =
-			fl->signal_groups[signal_id / FASTRPC_DSPSIGNAL_GROUP_SIZE];
+			found->signal_groups[signal_id / FASTRPC_DSPSIGNAL_GROUP_SIZE];
 		struct fastrpc_dspsignal *sig =
 			&group[signal_id % FASTRPC_DSPSIGNAL_GROUP_SIZE];
 		if ((sig->state == DSPSIGNAL_STATE_PENDING) ||
@@ -3108,7 +3123,8 @@ static void fastrpc_handle_signal_rpmsg(uint64_t msg, struct fastrpc_channel_ctx
 		pr_err("Received unknown signal %u for PID %u\n",
 				signal_id, pid);
 	}
-	spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
+	spin_unlock(&found->dspsignals_lock);
+	spin_unlock_irqrestore(&cctx->lock, irq_flags);
 }
 
 static void fastrpc_notify_user_ctx(struct fastrpc_invoke_ctx *ctx, int retval,

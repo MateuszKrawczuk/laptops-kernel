@@ -1308,10 +1308,19 @@ static inline int fastrpc_wait_for_response(struct fastrpc_invoke_ctx *ctx,
 {
 	int interrupted = 0;
 
-	if (kernel)
-		wait_for_completion(&ctx->work);
-	else
+	if (kernel) {
+		/*
+		 * Restore the mainline safety timeout for kernel-initiated
+		 * invokes (e.g. PD/process creation). The #09 early-wakeup port
+		 * had replaced this with an unbounded wait_for_completion(), so
+		 * an unresponsive DSP wedged the caller in an uninterruptible
+		 * (D-state, unkillable) wait forever instead of failing cleanly.
+		 */
+		if (!wait_for_completion_timeout(&ctx->work, 10 * HZ))
+			interrupted = -ETIMEDOUT;
+	} else {
 		interrupted = wait_for_completion_interruptible(&ctx->work);
+	}
 
 	return interrupted;
 }
@@ -1370,9 +1379,16 @@ static void fastrpc_wait_for_completion(struct fastrpc_invoke_ctx *ctx,
 				return;
 			break;
 		default:
+			/*
+			 * Unknown/unsupported rsp_flags (e.g. STATUS_RESPONSE,
+			 * POLL_MODE, or garbage from the DSP). Must terminate the
+			 * loop: mark work done and return, otherwise the
+			 * while(!is_work_done) below spins forever.
+			 */
 			*ptr_interrupted = -EBADR;
+			ctx->is_work_done = true;
 			dev_err(ctx->fl->sctx->dev, "unsupported response type:0x%x\n", ctx->rsp_flags);
-			break;
+			return;
 		}
 	} while (!ctx->is_work_done);
 }
@@ -1860,6 +1876,9 @@ static int fastrpc_device_open(struct inode *inode, struct file *filp)
 	fl->sctx = fastrpc_session_alloc(fl);
 	if (!fl->sctx) {
 		dev_err(&cctx->rpdev->dev, "No session available\n");
+		filp->private_data = NULL;
+		fastrpc_channel_ctx_put(cctx);
+		mutex_destroy(&fl->signal_create_mutex);
 		mutex_destroy(&fl->mutex);
 		kfree(fl);
 
@@ -2213,6 +2232,14 @@ static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 
 	switch (invoke.req) {
 	case FASTRPC_INVOKE:
+		/*
+		 * We unconditionally read sizeof(struct fastrpc_enhanced_invoke)
+		 * below, so require the userspace buffer to be at least that
+		 * large; otherwise we'd over-read past invoke.size. (The #14 port
+		 * had dropped invoke.size validation here entirely.)
+		 */
+		if (invoke.size < sizeof(struct fastrpc_enhanced_invoke))
+			return -EINVAL;
 		/* nscalars is truncated here to max supported value */
 		if (copy_from_user(&einv, (void __user *)(uintptr_t)invoke.invparam,
 				   sizeof(struct fastrpc_enhanced_invoke)))
@@ -3035,6 +3062,12 @@ static void fastrpc_notify_users(struct fastrpc_user *user)
 	spin_lock(&user->lock);
 	list_for_each_entry(ctx, &user->pending, node) {
 		ctx->retval = -EPIPE;
+		/*
+		 * Mark work done so a kernel waiter in fastrpc_wait_for_completion()
+		 * exits its while(!is_work_done) loop on channel teardown/SSR
+		 * instead of re-entering wait_for_completion() and hanging.
+		 */
+		ctx->is_work_done = true;
 		complete(&ctx->work);
 	}
 	spin_unlock(&user->lock);
@@ -3215,12 +3248,18 @@ static int fastrpc_rpmsg_callback(struct rpmsg_device *rpdev, void *data,
 		return 0;
 	}
 
-	if (rspv2) {
-		if (rspv2->version != FASTRPC_RSP_VERSION2) {
-			dev_err(&cctx->rpdev->dev, "Incorrect response version %d\n", rspv2->version);
-			spin_unlock_irqrestore(&cctx->lock, flags);
-			return -EINVAL;
-		}
+	if (rspv2 && rspv2->version != FASTRPC_RSP_VERSION2) {
+		dev_err(&cctx->rpdev->dev, "Incorrect response version %d\n", rspv2->version);
+		/*
+		 * ctx was found via idr_find and holds a reference. A bare
+		 * return here would strand the waiter forever and leak the ctx
+		 * ref. Complete it with an error and drop the ref via put_work,
+		 * exactly like the normal completion path below.
+		 */
+		fastrpc_notify_user_ctx(ctx, -EINVAL, NORMAL_RESPONSE, 0);
+		spin_unlock_irqrestore(&cctx->lock, flags);
+		schedule_work(&ctx->put_work);
+		return 0;
 	}
 	fastrpc_notify_user_ctx(ctx, rsp->retval, rsp_flags, early_wake_time);
 	spin_unlock_irqrestore(&cctx->lock, flags);

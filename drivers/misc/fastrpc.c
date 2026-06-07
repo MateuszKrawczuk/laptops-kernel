@@ -1320,8 +1320,14 @@ static int fastrpc_internal_invoke(struct fastrpc_user *fl,  u32 kernel,
 	/*
 	 * Set message context as polled if the call is for a user PD
 	 * dynamic module and user has enabled poll mode.
+	 *
+	 * NOTE (local): auto-enable polling on poll-mode-capable channels
+	 * (e.g. x1e80100) even without the FASTRPC_IOCTL_SET_OPTION call, so the
+	 * dspqueue/HTP path works with userspace libs that don't issue it.
+	 * Poll times out (FASTRPC_POLL_MAX_TIMEOUT_US) and falls back to glink.
 	 */
-	if (handle > FASTRPC_MAX_STATIC_HANDLE && fl->pd == USER_PD && fl->poll_mode)
+	if (handle > FASTRPC_MAX_STATIC_HANDLE && fl->pd == USER_PD &&
+	    (fl->poll_mode || fl->cctx->poll_mode_supported))
 		ctx->is_polled = true;
 
 	err = fastrpc_wait_for_completion(ctx, kernel);

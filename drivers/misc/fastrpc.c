@@ -3228,6 +3228,43 @@ static int fastrpc_rpmsg_callback(struct rpmsg_device *rpdev, void *data,
 	if (len < sizeof(*rsp))
 		return -EINVAL;
 
+	/*
+	 * Early-wakeup broadcast from the DSP. The downstream/CLO fastrpc
+	 * driver routes ctx=0xabcdabcd by waking parked invokes; mainline
+	 * historically drops it, stranding userspace dspqueue completion
+	 * (the have_dspsignal=0 fallback). Wake the oldest unfinished ctx and
+	 * remove it from the idr so a late per-ctx response falls through the
+	 * drop path instead of double-completing.
+	 */
+	if (rsp->ctx == 0xabcdabcd) {
+		struct fastrpc_invoke_ctx *iter, *target = NULL;
+		int id;
+
+		spin_lock_irqsave(&cctx->lock, flags);
+		idr_for_each_entry(&cctx->ctx_idr, iter, id) {
+			if (!iter->is_work_done) {
+				target = iter;
+				break;
+			}
+		}
+		if (target) {
+			idr_remove(&cctx->ctx_idr, target->ctxid >> 4);
+			fastrpc_notify_user_ctx(target, rsp->retval, NORMAL_RESPONSE, 0);
+		}
+		spin_unlock_irqrestore(&cctx->lock, flags);
+		if (target) {
+			dev_info(&rpdev->dev,
+				 "FRPC-DIAG bcast-wake: ctxid=0x%x sc=0x%x retval=%d\n",
+				 (u32)target->ctxid, target->sc, rsp->retval);
+			schedule_work(&target->put_work);
+		} else {
+			dev_info(&rpdev->dev,
+				 "FRPC-DIAG bcast: no parked ctx, retval=%d\n",
+				 rsp->retval);
+		}
+		return 0;
+	}
+
 	if (len >= sizeof(*rspv2)) {
 		rspv2 = data;
 		if (rspv2) {
